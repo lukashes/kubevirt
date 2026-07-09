@@ -1558,6 +1558,68 @@ var _ = Describe(SIG("Hotplug", func() {
 			Expect(err).ToNot(HaveOccurred(), "failed to create ResourceQuota")
 		}
 
+		It("should recreate an attachment pod when the owner reference cannot be resolved", func() {
+			const checkVolumeName = "checkvolume"
+			volumeMode := k8sv1.PersistentVolumeBlock
+			storageClass, _ := libstorage.GetRWXBlockStorageClass()
+
+			vmi := libvmifact.NewAlpineWithTestTooling()
+			var err error
+			vm = libvmi.NewVirtualMachine(vmi, libvmi.WithRunStrategy(v1.RunStrategyAlways))
+			vm, err = virtClient.VirtualMachine(testsuite.GetTestNamespace(vm)).Create(context.Background(), vm, metav1.CreateOptions{})
+			Expect(err).ToNot(HaveOccurred(), "failed to create VirtualMachine")
+
+			Eventually(matcher.ThisVM(vm)).WithTimeout(300 * time.Second).WithPolling(time.Second).Should(matcher.BeReady())
+
+			By("creating a blank hotplug volume")
+			hpvolume = libdv.NewDataVolume(
+				libdv.WithNamespace(testsuite.GetTestNamespace(nil)),
+				libdv.WithBlankImageSource(),
+				libdv.WithStorage(
+					libdv.StorageWithStorageClass(storageClass),
+					libdv.StorageWithVolumeSize(cd.BlankVolumeSize),
+					libdv.StorageWithReadWriteManyAccessMode(),
+					libdv.StorageWithVolumeMode(volumeMode),
+				),
+			)
+			dv, err := virtClient.CdiClient().CdiV1beta1().DataVolumes(hpvolume.Namespace).Create(context.Background(), hpvolume, metav1.CreateOptions{})
+			Expect(err).ToNot(HaveOccurred(), "failed to create DataVolume")
+
+			By("waiting for the dv import to pvc to finish")
+			libstorage.EventuallyDV(dv, 180, Or(matcher.HaveSucceeded(), matcher.WaitForFirstConsumer()))
+
+			vmi, err = virtClient.VirtualMachineInstance(vm.Namespace).Get(context.Background(), vmi.Name, metav1.GetOptions{})
+			Expect(err).ToNot(HaveOccurred(), "failed to get VirtualMachineInstance %s/%s", vm.Namespace, vmi.Name)
+
+			By("hotplugging the volume")
+			addDVVolumeVM(vmi.Name, vmi.Namespace, checkVolumeName, hpvolume.Name, v1.DiskBusSCSI, false, "")
+			libstorage.VerifyVolumeAndDiskInVMISpec(virtClient, vmi, checkVolumeName)
+			libstorage.VerifyVolumeStatus(virtClient, vmi, v1.VolumeReady, "", true, checkVolumeName)
+
+			vmi, err = virtClient.VirtualMachineInstance(vmi.Namespace).Get(context.Background(), vmi.Name, metav1.GetOptions{})
+			Expect(err).ToNot(HaveOccurred(), "failed to get VirtualMachineInstance %s/%s", vmi.Namespace, vmi.Name)
+			attachmentPodName := libstorage.AttachmentPodName(vmi)
+			Expect(attachmentPodName).ToNot(BeEmpty(), "attachment pod name should not be empty for VMI %s/%s", vmi.Namespace, vmi.Name)
+
+			By("removing the attachment pod owner reference")
+			attachmentPod, err := virtClient.CoreV1().Pods(vmi.Namespace).Get(context.Background(), attachmentPodName, metav1.GetOptions{})
+			Expect(err).ToNot(HaveOccurred(), "failed to get attachment pod %s", attachmentPodName)
+			Expect(attachmentPod.Annotations).To(HaveKeyWithValue(v1.OwnerVMINameAnnotation, vmi.Name))
+			Expect(attachmentPod.Annotations).To(HaveKeyWithValue(v1.OwnerVMIUIDAnnotation, string(vmi.UID)))
+
+			patchBytes, err := patch.New(patch.WithReplace("/metadata/ownerReferences", []metav1.OwnerReference{})).GeneratePayload()
+			Expect(err).ToNot(HaveOccurred(), "failed to generate attachment pod patch")
+			attachmentPod, err = virtClient.CoreV1().Pods(vmi.Namespace).Patch(context.Background(), attachmentPodName, types.JSONPatchType, patchBytes, metav1.PatchOptions{})
+			Expect(err).ToNot(HaveOccurred(), "failed to remove owner references from attachment pod %s", attachmentPodName)
+			Expect(attachmentPod.OwnerReferences).To(BeEmpty(), "attachment pod should not be recoverable through the owner chain")
+
+			By("removing the hotplug volume while the attachment pod has no owner reference")
+			removeVolumeVM(vm.Name, vm.Namespace, checkVolumeName, false)
+
+			By("verifying the volume removal completes")
+			verifyVolumeAndDiskVMRemoved(vm, checkVolumeName)
+		})
+
 		DescribeTable("should remain active", func(limitHotplugPodCreation bool, hotplugPodDeletionTimes int) {
 			checkVolumeName := "checkvolume"
 			volumeMode := k8sv1.PersistentVolumeBlock
